@@ -1,0 +1,33 @@
+# Ignore everything by default.
+*
+
+# Keep Docker/Azure build artifacts.
+!.dockerignore
+!infra/
+!infra/azure/
+!infra/azure/Dockerfile
+!infra/azure/requirements-job.txt
+
+# Keep only runtime scripts required by the daily pipeline.
+!scripts/
+scripts/*
+!scripts/house_contacts.py
+!scripts/senate_contacts.py
+!scripts/committee_membership.py
+!scripts/utils.py
+
+# Keep only DB/pipeline scripts required by the daily pipeline.
+!statt/
+statt/*
+!statt/load_committees.py
+!statt/load_committee_members.py
+!statt/run_daily_committee_pipeline.py
+!statt/sql_migrations.py
+!statt/sql/
+!statt/sql/create_or_migrate_committees.sql
+!statt/sql/create_or_migrate_committee_members.sql
+
+# Keep YAML sources used as intermediate pipeline inputs/outputs.
+!legislators-current.yaml
+!committees-current.yaml
+!committee-membership-current.yaml

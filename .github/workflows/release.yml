@@ -1,0 +1,76 @@
+name: release
+
+on:
+  workflow_dispatch:
+
+env:
+  ACR_REGISTRY_NAME: "stattregistry"
+  ACR_REPOSITORY_NAME: "congress-legislators"
+  IMAGE_TAG_PREFIX: "production"
+  AZURE_RESOURCE_GROUP: "Statt"
+  CONTAINER_APP_JOB_NAME: "legislator-committee-import"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_REGISTRY_NAME }}
+
+      - name: Build and Push Docker image to ACR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./infra/azure/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:${{ env.IMAGE_TAG_PREFIX }}-${{ steps.vars.outputs.SHORT_SHA }}
+            ${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:${{ env.IMAGE_TAG_PREFIX }}
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            COMMIT_SHA=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:buildcache,mode=max
+
+      - name: Display Pushed Image Tag
+        run: |
+          echo "Successfully pushed images:"
+          echo "  ${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:${{ env.IMAGE_TAG_PREFIX }}-${{ steps.vars.outputs.SHORT_SHA }}"
+          echo "  ${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:${{ env.IMAGE_TAG_PREFIX }}"
+
+      - name: Validate Deploy Variables
+        run: |
+          test -n "${{ env.AZURE_RESOURCE_GROUP }}" || (echo "Missing repo variable: AZURE_RESOURCE_GROUP" && exit 1)
+          test -n "${{ env.CONTAINER_APP_JOB_NAME }}" || (echo "Missing repo variable: CONTAINER_APP_JOB_NAME" && exit 1)
+
+      - name: Ensure Container Apps CLI Extension
+        run: az extension add --name containerapp --upgrade --yes
+
+      - name: Deploy Image to Azure Container Apps Job
+        run: |
+          IMAGE="${{ env.ACR_REGISTRY_NAME }}.azurecr.io/${{ env.ACR_REPOSITORY_NAME }}:${{ env.IMAGE_TAG_PREFIX }}-${{ steps.vars.outputs.SHORT_SHA }}"
+          az containerapp job update \
+            --name "${{ env.CONTAINER_APP_JOB_NAME }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --image "$IMAGE"
+          echo "Updated Container Apps Job image to: $IMAGE"
