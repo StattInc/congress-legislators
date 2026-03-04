@@ -168,7 +168,6 @@ def sync_committee_members(database_url: str, members: List[Dict[str, Any]], as_
     select_current_sql = text(
         """
         SELECT
-            id,
             committee_id,
             bioguide_id,
             name,
@@ -222,7 +221,8 @@ def sync_committee_members(database_url: str, members: List[Dict[str, Any]], as_
             title = :title,
             chamber = :chamber,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = :id
+        WHERE committee_id = :committee_id
+          AND bioguide_id = :bioguide_id
           AND is_current = TRUE;
         """
     )
@@ -234,7 +234,8 @@ def sync_committee_members(database_url: str, members: List[Dict[str, Any]], as_
             is_current = FALSE,
             expiration_date = :expiration_date,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = :id
+        WHERE committee_id = :committee_id
+          AND bioguide_id = :bioguide_id
           AND is_current = TRUE;
         """
     )
@@ -282,15 +283,14 @@ def sync_committee_members(database_url: str, members: List[Dict[str, Any]], as_
                 existing_effective = existing.get("effective_date")
 
                 if existing_effective == as_of_date:
-                    payload = dict(incoming)
-                    payload["id"] = existing["id"]
-                    conn.execute(update_in_place_sql, payload)
+                    conn.execute(update_in_place_sql, incoming)
                 else:
                     expiration_date = as_of_date - timedelta(days=1)
                     conn.execute(
                         expire_sql,
                         {
-                            "id": existing["id"],
+                            "committee_id": key[0],
+                            "bioguide_id": key[1],
                             "expiration_date": expiration_date,
                         },
                     )
@@ -312,7 +312,8 @@ def sync_committee_members(database_url: str, members: List[Dict[str, Any]], as_
             conn.execute(
                 expire_sql,
                 {
-                    "id": existing["id"],
+                    "committee_id": key[0],
+                    "bioguide_id": key[1],
                     "expiration_date": expiration_date,
                 },
             )
