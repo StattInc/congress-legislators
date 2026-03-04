@@ -146,7 +146,6 @@ def sync_committees(database_url: str, committees: List[Dict[str, Any]], as_of_d
     select_current_sql = text(
         """
         SELECT
-            id,
             thomas_id,
             type,
             name,
@@ -233,7 +232,7 @@ def sync_committees(database_url: str, committees: List[Dict[str, Any]], as_of_d
             parent_committee_id = :parent_committee_id,
             is_subcommittee = :is_subcommittee,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = :id
+        WHERE thomas_id = :thomas_id
           AND is_current = TRUE;
         """
     )
@@ -245,7 +244,7 @@ def sync_committees(database_url: str, committees: List[Dict[str, Any]], as_of_d
             is_current = FALSE,
             expiration_date = :expiration_date,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = :id
+        WHERE thomas_id = :thomas_id
           AND is_current = TRUE;
         """
     )
@@ -291,15 +290,13 @@ def sync_committees(database_url: str, committees: List[Dict[str, Any]], as_of_d
                 existing_effective = existing.get("effective_date")
 
                 if existing_effective == as_of_date:
-                    payload = dict(incoming)
-                    payload["id"] = existing["id"]
-                    conn.execute(update_in_place_sql, payload)
+                    conn.execute(update_in_place_sql, incoming)
                 else:
                     expiration_date = as_of_date - timedelta(days=1)
                     conn.execute(
                         expire_sql,
                         {
-                            "id": existing["id"],
+                            "thomas_id": thomas_id,
                             "expiration_date": expiration_date,
                         },
                     )
@@ -321,7 +318,7 @@ def sync_committees(database_url: str, committees: List[Dict[str, Any]], as_of_d
             conn.execute(
                 expire_sql,
                 {
-                    "id": existing["id"],
+                    "thomas_id": thomas_id,
                     "expiration_date": expiration_date,
                 },
             )
