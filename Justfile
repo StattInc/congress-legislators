@@ -29,8 +29,17 @@ load-committee-members:
 update-us-federal-legislators:
   {{python}} statt/update_us_federal_legislators.py
 
+apply-legislator-history-ddl:
+  {{python}} statt/apply_legislator_history_ddl.py
+
+load-legislator-history:
+  {{python}} statt/load_legislator_history.py
+
 run-daily-pipeline:
-  {{python}} statt/run_daily_committee_pipeline.py
+  {{python}} statt/run_daily_pipeline.py
+
+run-daily-legislator-pipeline:
+  {{python}} statt/run_daily_pipeline.py
 
 # Generic runners for ad-hoc scripts.
 run-script script:

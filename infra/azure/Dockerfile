@@ -11,4 +11,4 @@ RUN pip install --upgrade pip && pip install -r /tmp/requirements-job.txt
 
 COPY . /app
 
-CMD ["python", "statt/run_daily_committee_pipeline.py"]
+CMD ["python", "statt/run_daily_pipeline.py"]

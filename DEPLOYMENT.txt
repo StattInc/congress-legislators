@@ -1,0 +1,18 @@
+ACR_NAME="stattregistry"
+ACR="stattregistry.azurecr.io"
+REPO="congress-legislators"
+
+az login
+az acr login -n "$ACR_NAME"
+
+docker buildx build \
+  --platform linux/amd64 \
+  -f infra/azure/Dockerfile \
+  -t "$ACR/$REPO:production" \
+  --push \
+  .
+
+az containerapp job update \
+  --name legislator-committee-import \
+  --resource-group Statt \
+  --image "$ACR/$REPO:production"
