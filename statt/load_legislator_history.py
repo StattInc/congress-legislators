@@ -168,7 +168,16 @@ def normalize_chamber(value: Any) -> Optional[str]:
     return chamber
 
 
-def default_display_name(first_name: Optional[str], middle_name: Optional[str], last_name: Optional[str]) -> Optional[str]:
+def default_display_name(
+    first_name: Optional[str],
+    middle_name: Optional[str],
+    last_name: Optional[str],
+    nickname: Optional[str],
+) -> Optional[str]:
+    if nickname:
+        name_parts = [part for part in [nickname, last_name] if part]
+        return " ".join(name_parts) if name_parts else None
+
     fallback_first = first_name
     if fallback_first and "." in fallback_first:
         fallback_first = middle_name or fallback_first
@@ -261,6 +270,7 @@ def build_profile_row(record: Mapping[str, Any], source_priority: int) -> Dict[s
             normalize_string(name.get("first")),
             normalize_string(name.get("middle")),
             normalize_string(name.get("last")),
+            normalize_string(name.get("nickname")),
         ),
         "birthday": parse_date(bio.get("birthday")),
         "gender": normalize_string(bio.get("gender")),
@@ -515,6 +525,8 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
         UPDATE civic.us_federal_legislator_profiles
         SET
             display_name = CASE
+                WHEN nickname IS NOT NULL AND nickname != ''
+                    THEN CONCAT_WS(' ', nickname, last_name)
                 WHEN first_name LIKE '%%.%%'
                     THEN CONCAT_WS(' ', middle_name, last_name)
                 ELSE CONCAT_WS(' ', first_name, last_name)
