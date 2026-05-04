@@ -16,9 +16,12 @@ Usage:
 import json
 import os
 import sys
+import csv
+import io
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 from dotenv import load_dotenv
@@ -27,6 +30,8 @@ from sqlalchemy import create_engine, text
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+DB_BATCH_SIZE = max(1, int(os.getenv("LEGISLATOR_SYNC_BATCH_SIZE", "5000")))
+COPY_NULL_TOKEN = "__CODEX_NULL__"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CURRENT_YAML_PATH = ROOT / "legislators-current.yaml"
 DEFAULT_HISTORICAL_YAML_PATH = ROOT / "legislators-historical.yaml"
@@ -76,6 +81,73 @@ def normalize_string(value: Any) -> Optional[str]:
         return None
     text_value = str(value).strip()
     return text_value or None
+
+
+def log_phase(message: str) -> None:
+    print(message, flush=True)
+
+
+def chunk_rows(rows: Sequence[Dict[str, Any]], chunk_size: int) -> Iterable[Sequence[Dict[str, Any]]]:
+    for start in range(0, len(rows), chunk_size):
+        yield rows[start : start + chunk_size]
+
+
+def run_logged_statement(conn, sql, params, start_message: str, done_message: str) -> None:
+    log_phase(start_message)
+    phase_timer = time.monotonic()
+    if params is None:
+        conn.execute(sql)
+    elif isinstance(params, list) and len(params) > DB_BATCH_SIZE:
+        total_rows = len(params)
+        total_chunks = (total_rows + DB_BATCH_SIZE - 1) // DB_BATCH_SIZE
+        for chunk_index, chunk in enumerate(chunk_rows(params, DB_BATCH_SIZE), start=1):
+            chunk_timer = time.monotonic()
+            conn.execute(sql, chunk)
+            log_phase(
+                f"  chunk {chunk_index}/{total_chunks}: {len(chunk)} rows in "
+                f"{time.monotonic() - chunk_timer:.2f}s"
+            )
+    else:
+        conn.execute(sql, params)
+    log_phase(f"{done_message} in {time.monotonic() - phase_timer:.2f}s")
+
+
+def format_copy_value(value: Any) -> str:
+    if value is None:
+        return COPY_NULL_TOKEN
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def copy_rows_to_table(conn, copy_sql: str, columns: Sequence[str], rows: Sequence[Dict[str, Any]], label: str) -> None:
+    if not rows:
+        log_phase(f"DB phase: no rows to stage for {label}")
+        return
+
+    total_rows = len(rows)
+    total_chunks = (total_rows + DB_BATCH_SIZE - 1) // DB_BATCH_SIZE
+    dbapi_conn = conn.connection.driver_connection
+
+    with dbapi_conn.cursor() as cursor:
+        overall_timer = time.monotonic()
+        for chunk_index, chunk in enumerate(chunk_rows(rows, DB_BATCH_SIZE), start=1):
+            buffer = io.StringIO()
+            writer = csv.writer(buffer, delimiter="\t", quotechar='"', lineterminator="\n")
+            for row in chunk:
+                writer.writerow([format_copy_value(row.get(column)) for column in columns])
+            buffer.seek(0)
+
+            chunk_timer = time.monotonic()
+            cursor.copy_expert(copy_sql, buffer)
+            log_phase(
+                f"  COPY chunk {chunk_index}/{total_chunks} for {label}: {len(chunk)} rows in "
+                f"{time.monotonic() - chunk_timer:.2f}s"
+            )
+
+    log_phase(f"DB phase complete: staged {total_rows} {label} rows via COPY in {time.monotonic() - overall_timer:.2f}s")
 
 
 def chamber_for_term(term_type: str) -> str:
@@ -369,6 +441,28 @@ def build_staged_rows(
 def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
     engine = create_engine(database_url)
 
+    create_temp_profiles_sql = text(
+        """
+        CREATE TEMP TABLE temp_us_federal_legislator_profiles (
+            bioguide_id TEXT NOT NULL,
+            first_name TEXT,
+            middle_name TEXT,
+            last_name TEXT,
+            suffix TEXT,
+            nickname TEXT,
+            official_full TEXT,
+            display_name TEXT,
+            birthday DATE,
+            gender TEXT,
+            other_names TEXT
+        ) ON COMMIT DROP
+        """
+    )
+    copy_profiles_sql = (
+        f"COPY temp_us_federal_legislator_profiles "
+        f"(bioguide_id, first_name, middle_name, last_name, suffix, nickname, official_full, display_name, birthday, gender, other_names) "
+        f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '{COPY_NULL_TOKEN}')"
+    )
     upsert_profiles_sql = text(
         """
         INSERT INTO civic.us_federal_legislator_profiles (
@@ -383,19 +477,20 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
             birthday,
             gender,
             other_names
-        ) VALUES (
-            :bioguide_id,
-            :first_name,
-            :middle_name,
-            :last_name,
-            :suffix,
-            :nickname,
-            :official_full,
-            :display_name,
-            :birthday,
-            :gender,
-            CAST(:other_names AS JSONB)
         )
+        SELECT
+            s.bioguide_id,
+            s.first_name,
+            s.middle_name,
+            s.last_name,
+            s.suffix,
+            s.nickname,
+            s.official_full,
+            s.display_name,
+            s.birthday,
+            s.gender,
+            CAST(s.other_names AS JSONB)
+        FROM temp_us_federal_legislator_profiles s
         ON CONFLICT (bioguide_id) DO UPDATE
         SET
             first_name = EXCLUDED.first_name,
@@ -412,53 +507,6 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
             gender = EXCLUDED.gender,
             other_names = EXCLUDED.other_names,
             updated_at = CURRENT_TIMESTAMP
-        """
-    )
-
-    legacy_profiles_exist_sql = text(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'civic'
-              AND table_name = 'us_federal_legislators'
-        )
-        """
-    )
-
-    backfill_from_legacy_sql = text(
-        """
-        UPDATE civic.us_federal_legislator_profiles AS p
-        SET
-            about_page_url = COALESCE(p.about_page_url, legacy.about_page_url),
-            biography = COALESCE(p.biography, legacy.biography),
-            display_name = COALESCE(
-                p.display_name,
-                legacy.display_name,
-                CASE
-                    WHEN legacy.first_name LIKE '%%.%%'
-                        THEN CONCAT_WS(' ', legacy.middle_name, legacy.last_name)
-                    ELSE CONCAT_WS(' ', legacy.first_name, legacy.last_name)
-                END
-            ),
-            updated_at = CASE
-                WHEN p.about_page_url IS NULL AND legacy.about_page_url IS NOT NULL THEN CURRENT_TIMESTAMP
-                WHEN p.biography IS NULL AND legacy.biography IS NOT NULL THEN CURRENT_TIMESTAMP
-                WHEN p.display_name IS NULL AND (
-                    legacy.display_name IS NOT NULL OR
-                    legacy.first_name IS NOT NULL OR
-                    legacy.middle_name IS NOT NULL OR
-                    legacy.last_name IS NOT NULL
-                ) THEN CURRENT_TIMESTAMP
-                ELSE p.updated_at
-            END
-        FROM civic.us_federal_legislators AS legacy
-        WHERE legacy.bioguide_id = p.bioguide_id
-          AND (
-              p.about_page_url IS NULL OR
-              p.biography IS NULL OR
-              p.display_name IS NULL
-          )
         """
     )
 
@@ -481,12 +529,23 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
         """
     )
 
-    clear_party_affiliations_sql = text("DELETE FROM civic.us_federal_legislator_party_affiliations")
-    clear_leadership_roles_sql = text("DELETE FROM civic.us_federal_legislator_leadership_roles")
-    clear_terms_sql = text("DELETE FROM civic.us_federal_legislator_terms")
-    clear_ids_sql = text("DELETE FROM civic.us_federal_legislator_ids")
-
-    insert_ids_sql = text(
+    create_temp_ids_sql = text(
+        """
+        CREATE TEMP TABLE temp_us_federal_legislator_ids (
+            bioguide_id TEXT NOT NULL,
+            id_type TEXT NOT NULL,
+            id_value TEXT NOT NULL,
+            is_previous BOOLEAN NOT NULL,
+            sort_order INTEGER
+        ) ON COMMIT DROP
+        """
+    )
+    copy_ids_sql = (
+        f"COPY temp_us_federal_legislator_ids "
+        f"(bioguide_id, id_type, id_value, is_previous, sort_order) "
+        f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '{COPY_NULL_TOKEN}')"
+    )
+    sync_ids_sql = text(
         """
         INSERT INTO civic.us_federal_legislator_ids (
             bioguide_id,
@@ -495,18 +554,72 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
             is_previous,
             sort_order,
             updated_at
-        ) VALUES (
-            :bioguide_id,
-            :id_type,
-            :id_value,
-            :is_previous,
-            :sort_order,
+        )
+        SELECT
+            s.bioguide_id,
+            s.id_type,
+            s.id_value,
+            s.is_previous,
+            s.sort_order,
             CURRENT_TIMESTAMP
+        FROM temp_us_federal_legislator_ids s
+        ON CONFLICT (bioguide_id, id_type, id_value) DO UPDATE
+        SET
+            is_previous = EXCLUDED.is_previous,
+            sort_order = EXCLUDED.sort_order,
+            updated_at = CURRENT_TIMESTAMP
+        """
+    )
+    delete_stale_ids_sql = text(
+        """
+        DELETE FROM civic.us_federal_legislator_ids t
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM temp_us_federal_legislator_ids s
+            WHERE s.bioguide_id = t.bioguide_id
+              AND s.id_type = t.id_type
+              AND s.id_value = t.id_value
         )
         """
     )
 
-    insert_terms_sql = text(
+    create_temp_terms_sql = text(
+        """
+        CREATE TEMP TABLE temp_us_federal_legislator_terms (
+            term_key TEXT NOT NULL,
+            bioguide_id TEXT NOT NULL,
+            term_ordinal INTEGER NOT NULL,
+            term_type TEXT NOT NULL,
+            chamber TEXT NOT NULL,
+            start_date DATE NOT NULL,
+            end_date DATE NOT NULL,
+            state_code TEXT NOT NULL,
+            district INTEGER,
+            senate_class INTEGER,
+            state_rank TEXT,
+            party TEXT,
+            caucus TEXT,
+            how TEXT,
+            end_type TEXT,
+            url TEXT,
+            address TEXT,
+            phone TEXT,
+            fax TEXT,
+            contact_form TEXT,
+            office TEXT,
+            rss_url TEXT,
+            seat_key TEXT,
+            is_current BOOLEAN NOT NULL,
+            source_file TEXT NOT NULL
+        ) ON COMMIT DROP
+        """
+    )
+    copy_terms_sql = (
+        f"COPY temp_us_federal_legislator_terms "
+        f"(term_key, bioguide_id, term_ordinal, term_type, chamber, start_date, end_date, state_code, district, senate_class, state_rank, party, caucus, how, end_type, url, address, phone, fax, contact_form, office, rss_url, seat_key, is_current, source_file) "
+        f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '{COPY_NULL_TOKEN}')"
+    )
+    sync_terms_sql = text(
         """
         INSERT INTO civic.us_federal_legislator_terms (
             term_key,
@@ -535,38 +648,95 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
             is_current,
             source_file,
             updated_at
-        ) VALUES (
-            :term_key,
-            :bioguide_id,
-            :term_ordinal,
-            :term_type,
-            :chamber,
-            :start_date,
-            :end_date,
-            :state_code,
-            :district,
-            :senate_class,
-            :state_rank,
-            :party,
-            :caucus,
-            :how,
-            :end_type,
-            :url,
-            :address,
-            :phone,
-            :fax,
-            :contact_form,
-            :office,
-            :rss_url,
-            :seat_key,
-            :is_current,
-            :source_file,
+        )
+        SELECT
+            s.term_key,
+            s.bioguide_id,
+            s.term_ordinal,
+            s.term_type,
+            s.chamber,
+            s.start_date,
+            s.end_date,
+            s.state_code,
+            s.district,
+            s.senate_class,
+            s.state_rank,
+            s.party,
+            s.caucus,
+            s.how,
+            s.end_type,
+            s.url,
+            s.address,
+            s.phone,
+            s.fax,
+            s.contact_form,
+            s.office,
+            s.rss_url,
+            s.seat_key,
+            s.is_current,
+            s.source_file,
             CURRENT_TIMESTAMP
+        FROM temp_us_federal_legislator_terms s
+        ON CONFLICT (term_key) DO UPDATE
+        SET
+            bioguide_id = EXCLUDED.bioguide_id,
+            term_ordinal = EXCLUDED.term_ordinal,
+            term_type = EXCLUDED.term_type,
+            chamber = EXCLUDED.chamber,
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            state_code = EXCLUDED.state_code,
+            district = EXCLUDED.district,
+            senate_class = EXCLUDED.senate_class,
+            state_rank = EXCLUDED.state_rank,
+            party = EXCLUDED.party,
+            caucus = EXCLUDED.caucus,
+            how = EXCLUDED.how,
+            end_type = EXCLUDED.end_type,
+            url = EXCLUDED.url,
+            address = EXCLUDED.address,
+            phone = EXCLUDED.phone,
+            fax = EXCLUDED.fax,
+            contact_form = EXCLUDED.contact_form,
+            office = EXCLUDED.office,
+            rss_url = EXCLUDED.rss_url,
+            seat_key = EXCLUDED.seat_key,
+            is_current = EXCLUDED.is_current,
+            source_file = EXCLUDED.source_file,
+            updated_at = CURRENT_TIMESTAMP
+        """
+    )
+    delete_stale_terms_sql = text(
+        """
+        DELETE FROM civic.us_federal_legislator_terms t
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM temp_us_federal_legislator_terms s
+            WHERE s.term_key = t.term_key
         )
         """
     )
 
-    insert_party_affiliations_sql = text(
+    create_temp_party_affiliations_sql = text(
+        """
+        CREATE TEMP TABLE temp_us_federal_legislator_party_affiliations (
+            affiliation_key TEXT NOT NULL,
+            term_key TEXT NOT NULL,
+            bioguide_id TEXT NOT NULL,
+            start_date DATE NOT NULL,
+            end_date DATE NOT NULL,
+            party TEXT,
+            caucus TEXT,
+            is_current BOOLEAN NOT NULL
+        ) ON COMMIT DROP
+        """
+    )
+    copy_party_affiliations_sql = (
+        f"COPY temp_us_federal_legislator_party_affiliations "
+        f"(affiliation_key, term_key, bioguide_id, start_date, end_date, party, caucus, is_current) "
+        f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '{COPY_NULL_TOKEN}')"
+    )
+    sync_party_affiliations_sql = text(
         """
         INSERT INTO civic.us_federal_legislator_party_affiliations (
             affiliation_key,
@@ -578,21 +748,60 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
             caucus,
             is_current,
             updated_at
-        ) VALUES (
-            :affiliation_key,
-            :term_key,
-            :bioguide_id,
-            :start_date,
-            :end_date,
-            :party,
-            :caucus,
-            :is_current,
+        )
+        SELECT
+            s.affiliation_key,
+            s.term_key,
+            s.bioguide_id,
+            s.start_date,
+            s.end_date,
+            s.party,
+            s.caucus,
+            s.is_current,
             CURRENT_TIMESTAMP
+        FROM temp_us_federal_legislator_party_affiliations s
+        ON CONFLICT (affiliation_key) DO UPDATE
+        SET
+            term_key = EXCLUDED.term_key,
+            bioguide_id = EXCLUDED.bioguide_id,
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            party = EXCLUDED.party,
+            caucus = EXCLUDED.caucus,
+            is_current = EXCLUDED.is_current,
+            updated_at = CURRENT_TIMESTAMP
+        """
+    )
+    delete_stale_party_affiliations_sql = text(
+        """
+        DELETE FROM civic.us_federal_legislator_party_affiliations t
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM temp_us_federal_legislator_party_affiliations s
+            WHERE s.affiliation_key = t.affiliation_key
         )
         """
     )
 
-    insert_leadership_roles_sql = text(
+    create_temp_leadership_roles_sql = text(
+        """
+        CREATE TEMP TABLE temp_us_federal_legislator_leadership_roles (
+            role_key TEXT NOT NULL,
+            bioguide_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            chamber TEXT,
+            start_date DATE NOT NULL,
+            end_date DATE,
+            is_current BOOLEAN NOT NULL
+        ) ON COMMIT DROP
+        """
+    )
+    copy_leadership_roles_sql = (
+        f"COPY temp_us_federal_legislator_leadership_roles "
+        f"(role_key, bioguide_id, title, chamber, start_date, end_date, is_current) "
+        f"FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '{COPY_NULL_TOKEN}')"
+    )
+    sync_leadership_roles_sql = text(
         """
         INSERT INTO civic.us_federal_legislator_leadership_roles (
             role_key,
@@ -603,15 +812,35 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
             end_date,
             is_current,
             updated_at
-        ) VALUES (
-            :role_key,
-            :bioguide_id,
-            :title,
-            :chamber,
-            :start_date,
-            :end_date,
-            :is_current,
+        )
+        SELECT
+            s.role_key,
+            s.bioguide_id,
+            s.title,
+            s.chamber,
+            s.start_date,
+            s.end_date,
+            s.is_current,
             CURRENT_TIMESTAMP
+        FROM temp_us_federal_legislator_leadership_roles s
+        ON CONFLICT (role_key) DO UPDATE
+        SET
+            bioguide_id = EXCLUDED.bioguide_id,
+            title = EXCLUDED.title,
+            chamber = EXCLUDED.chamber,
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            is_current = EXCLUDED.is_current,
+            updated_at = CURRENT_TIMESTAMP
+        """
+    )
+    delete_stale_leadership_roles_sql = text(
+        """
+        DELETE FROM civic.us_federal_legislator_leadership_roles t
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM temp_us_federal_legislator_leadership_roles s
+            WHERE s.role_key = t.role_key
         )
         """
     )
@@ -624,28 +853,147 @@ def sync_legislator_history(database_url: str, staged_rows: Dict[str, List[Dict[
         for row in staged_rows["profiles"]
     ]
 
+    phase_started = time.monotonic()
+
     with engine.begin() as conn:
-        if profile_rows:
-            conn.execute(upsert_profiles_sql, profile_rows)
+        run_logged_statement(conn, create_temp_profiles_sql, None, "DB phase: creating temp profiles stage table", "DB phase complete: temp profiles stage table")
+        copy_rows_to_table(
+            conn,
+            copy_profiles_sql,
+            [
+                "bioguide_id",
+                "first_name",
+                "middle_name",
+                "last_name",
+                "suffix",
+                "nickname",
+                "official_full",
+                "display_name",
+                "birthday",
+                "gender",
+                "other_names",
+            ],
+            profile_rows,
+            "profiles",
+        )
+        run_logged_statement(conn, upsert_profiles_sql, None, "DB phase: upserting profiles from staged snapshot", "DB phase complete: profiles")
 
-        legacy_profiles_exist = bool(conn.execute(legacy_profiles_exist_sql).scalar())
-        if legacy_profiles_exist:
-            conn.execute(backfill_from_legacy_sql)
-        conn.execute(backfill_display_name_sql)
+        run_logged_statement(
+            conn,
+            backfill_display_name_sql,
+            None,
+            "DB phase: backfilling missing display_name values from profile name fields",
+            "DB phase complete: display_name backfill",
+        )
 
-        conn.execute(clear_party_affiliations_sql)
-        conn.execute(clear_leadership_roles_sql)
-        conn.execute(clear_terms_sql)
-        conn.execute(clear_ids_sql)
+        run_logged_statement(conn, create_temp_ids_sql, None, "DB phase: creating temp ids stage table", "DB phase complete: temp ids stage table")
+        copy_rows_to_table(
+            conn,
+            copy_ids_sql,
+            ["bioguide_id", "id_type", "id_value", "is_previous", "sort_order"],
+            staged_rows["ids"],
+            "ids",
+        )
+        run_logged_statement(conn, sync_ids_sql, None, "DB phase: upserting ids from staged snapshot", "DB phase complete: synced ids")
 
-        if staged_rows["ids"]:
-            conn.execute(insert_ids_sql, staged_rows["ids"])
-        if staged_rows["terms"]:
-            conn.execute(insert_terms_sql, staged_rows["terms"])
-        if staged_rows["party_affiliations"]:
-            conn.execute(insert_party_affiliations_sql, staged_rows["party_affiliations"])
-        if staged_rows["leadership_roles"]:
-            conn.execute(insert_leadership_roles_sql, staged_rows["leadership_roles"])
+        run_logged_statement(conn, create_temp_terms_sql, None, "DB phase: creating temp terms stage table", "DB phase complete: temp terms stage table")
+        copy_rows_to_table(
+            conn,
+            copy_terms_sql,
+            [
+                "term_key",
+                "bioguide_id",
+                "term_ordinal",
+                "term_type",
+                "chamber",
+                "start_date",
+                "end_date",
+                "state_code",
+                "district",
+                "senate_class",
+                "state_rank",
+                "party",
+                "caucus",
+                "how",
+                "end_type",
+                "url",
+                "address",
+                "phone",
+                "fax",
+                "contact_form",
+                "office",
+                "rss_url",
+                "seat_key",
+                "is_current",
+                "source_file",
+            ],
+            staged_rows["terms"],
+            "terms",
+        )
+        run_logged_statement(conn, sync_terms_sql, None, "DB phase: upserting terms from staged snapshot", "DB phase complete: synced terms")
+
+        run_logged_statement(
+            conn,
+            create_temp_party_affiliations_sql,
+            None,
+            "DB phase: creating temp party affiliations stage table",
+            "DB phase complete: temp party affiliations stage table",
+        )
+        copy_rows_to_table(
+            conn,
+            copy_party_affiliations_sql,
+            ["affiliation_key", "term_key", "bioguide_id", "start_date", "end_date", "party", "caucus", "is_current"],
+            staged_rows["party_affiliations"],
+            "party affiliations",
+        )
+        run_logged_statement(
+            conn,
+            sync_party_affiliations_sql,
+            None,
+            "DB phase: upserting party affiliations from staged snapshot",
+            "DB phase complete: synced party affiliations",
+        )
+
+        run_logged_statement(
+            conn,
+            create_temp_leadership_roles_sql,
+            None,
+            "DB phase: creating temp leadership roles stage table",
+            "DB phase complete: temp leadership roles stage table",
+        )
+        copy_rows_to_table(
+            conn,
+            copy_leadership_roles_sql,
+            ["role_key", "bioguide_id", "title", "chamber", "start_date", "end_date", "is_current"],
+            staged_rows["leadership_roles"],
+            "leadership roles",
+        )
+        run_logged_statement(
+            conn,
+            sync_leadership_roles_sql,
+            None,
+            "DB phase: upserting leadership roles from staged snapshot",
+            "DB phase complete: synced leadership roles",
+        )
+
+        run_logged_statement(
+            conn,
+            delete_stale_party_affiliations_sql,
+            None,
+            "DB phase: deleting stale party affiliations",
+            "DB phase complete: deleted stale party affiliations",
+        )
+        run_logged_statement(
+            conn,
+            delete_stale_leadership_roles_sql,
+            None,
+            "DB phase: deleting stale leadership roles",
+            "DB phase complete: deleted stale leadership roles",
+        )
+        run_logged_statement(conn, delete_stale_terms_sql, None, "DB phase: deleting stale terms", "DB phase complete: deleted stale terms")
+        run_logged_statement(conn, delete_stale_ids_sql, None, "DB phase: deleting stale ids", "DB phase complete: deleted stale ids")
+
+    log_phase(f"DB sync complete in {time.monotonic() - phase_started:.2f}s")
 
     return {
         "profiles_upserted": len(profile_rows),
