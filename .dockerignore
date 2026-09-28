@@ -22,4 +22,5 @@ statt/*
 !statt/load_committees.py
 !statt/load_committee_members.py
 !statt/load_legislator_history.py
+!statt/load_legislator_images.py
 !statt/run_daily_pipeline.py
