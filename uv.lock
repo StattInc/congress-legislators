@@ -148,7 +148,7 @@ requires-dist = [
     { name = "rtyaml" },
     { name = "scrapelib", specifier = "==0.10.1" },
     { name = "sparqlwrapper" },
-    { name = "sqlalchemy", specifier = ">=2.0.48" },
+    { name = "sqlalchemy", specifier = ">=2.0.48,<2.1" },
     { name = "tweepy" },
 ]
 
