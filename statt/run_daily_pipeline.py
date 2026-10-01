@@ -95,6 +95,13 @@ def run_pipeline() -> None:
             cwd=ROOT,
             env=loader_env,
         )
+        # Runs last so a Congress.gov outage doesn't block the YAML-based loads above.
+        run_step(
+            "Load Legislator Images into Postgres",
+            [sys.executable, "statt/load_legislator_images.py"],
+            cwd=ROOT,
+            env=loader_env,
+        )
 
         print("\nDaily pipeline complete.")
     finally:

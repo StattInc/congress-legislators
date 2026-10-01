@@ -35,6 +35,9 @@ apply-legislator-history-ddl:
 load-legislator-history:
   {{python}} statt/load_legislator_history.py
 
+load-legislator-images:
+  {{python}} statt/load_legislator_images.py
+
 run-daily-pipeline:
   {{python}} statt/run_daily_pipeline.py
 

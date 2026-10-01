@@ -11,3 +11,4 @@
 /alternate_formats
 .env
 /local
+/.azure-tmp

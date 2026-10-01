@@ -12,9 +12,13 @@ CREATE TABLE IF NOT EXISTS civic.us_federal_legislator_profiles (
     other_names JSONB,
     about_page_url TEXT,
     biography TEXT,
+    image_url TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE civic.us_federal_legislator_profiles
+    ADD COLUMN IF NOT EXISTS image_url TEXT;
 
 CREATE TABLE IF NOT EXISTS civic.us_federal_legislator_ids (
     bioguide_id TEXT NOT NULL REFERENCES civic.us_federal_legislator_profiles (bioguide_id) ON DELETE CASCADE,
@@ -134,7 +138,9 @@ SELECT
     t.contact_form,
     t.office,
     t.rss_url,
-    t.seat_key
+    t.seat_key,
+    -- Appended last so CREATE OR REPLACE VIEW can add it to the existing view.
+    p.image_url
 FROM civic.us_federal_legislator_terms t
 JOIN civic.us_federal_legislator_profiles p
     ON p.bioguide_id = t.bioguide_id

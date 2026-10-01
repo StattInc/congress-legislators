@@ -269,11 +269,22 @@ def run():
 
     # look up senator by state and last name
     if (state, last_name) == ("NM", "Lujan"): last_name = "Luján"
-    if (state, last_name) not in senators:
+    moc = senators.get((state, last_name))
+    if moc is None:
+      # senate.gov sometimes lists only part of a compound surname (e.g. "Graham"
+      # for Darline Graham Nordone), so fall back to first name plus a surname word.
+      first_nodes = membernode.xpath("name/first")
+      first_name = first_nodes[0].text if first_nodes else None
+      candidates = {
+        m["id"]["bioguide"]: m
+        for (s, last), m in senators.items()
+        if s == state and last_name in last.split(" ") and m["name"].get("first") == first_name
+      }
+      if len(candidates) == 1:
+        moc = next(iter(candidates.values()))
+    if moc is None:
       print("\t[%s] Unknown member: %s" % (state, last_name))
       return None
-
-    moc = senators[(state, last_name)]
 
     entry = OrderedDict()
     if 'official_full' in moc['name']:
